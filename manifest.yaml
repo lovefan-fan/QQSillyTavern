@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Plugin
 metadata:
-  author: sanxianxiaohuntun
+  author: lovefan-fan
   name: QQSillyTavern
   repository: 'https://github.com/lovefan-fan/QQSillyTavern'
   version: 0.2.0
