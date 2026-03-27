@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: EventListener
+metadata:
+  name: legacy_bridge
+  label:
+    en_US: LegacyBridgeEventListener
+    zh_Hans: LegacyBridgeEventListener
+spec:
+execution:
+  python:
+    path: default.py
+    attr: DefaultEventListener

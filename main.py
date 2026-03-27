@@ -1,16 +1,16 @@
 from pkg.plugin.context import register, handler, BasePlugin, APIHost, EventContext
 from pkg.plugin.events import *
-from .system.image_processor import ImageProcessor
-from .system.chat_manager import ChatManager
-from .pojia.pojia_mode import PoJiaModePlugin
+from system.image_processor import ImageProcessor
+from system.chat_manager import ChatManager
+from pojia.pojia_mode import PoJiaModePlugin
 import os
 import yaml
-from .system.regex_processor import RegexProcessor
-from .system.user_manager import UserManager
-from .system.memory import Memory
+from system.regex_processor import RegexProcessor
+from system.user_manager import UserManager
+from system.memory import Memory
 from datetime import datetime
 from pkg.provider.entities import Message
-from .system.world_book_processor import WorldBookProcessor
+from system.world_book_processor import WorldBookProcessor
 from typing import Dict, Any, Callable, Awaitable, Optional, List
 
 # 通用错误处理装饰器
@@ -58,7 +58,7 @@ class CommandBase:
 class TavernPlugin(BasePlugin, CommandBase):
 
     # 插件加载时触发
-    def __init__(self, host: APIHost):
+    def __init__(self, host: Optional[APIHost] = None):
         BasePlugin.__init__(self, host)
         CommandBase.__init__(self)
         self.started_users = set()
@@ -1201,7 +1201,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             memory = Memory(character_path, self.host)
             
             # 获取短期记忆
-            messages = memory.get_short_term()
+            messages = await memory.get_short_term(is_group=is_group, session_id=str(user_id))
             
             # 从最新到最旧遍历消息，寻找助手消息中的状态块
             if messages:
@@ -1573,8 +1573,8 @@ class TavernPlugin(BasePlugin, CommandBase):
         # 获取记忆状态
         character_path = self.user_manager.get_character_path(user_id, current_character, is_group)
         memory = Memory(character_path, self.host)
-        short_term = memory.get_short_term()
-        long_term = memory.get_long_term()
+        short_term = await memory.get_short_term(is_group=is_group, session_id=str(user_id))
+        long_term = await memory.get_long_term(is_group=is_group, session_id=str(user_id))
         
         # 构建显示信息
         info = [
@@ -1653,7 +1653,7 @@ class TavernPlugin(BasePlugin, CommandBase):
         current_character = self.user_manager.get_user_character(user_id, is_group)
         character_path = self.user_manager.get_character_path(user_id, current_character, is_group)
         memory = Memory(character_path, self.host)
-        memory.save_short_term([])
+        await memory.save_short_term([], is_group=is_group, session_id=str(user_id))
         
         ctx.add_return("reply", ["已清空对话历史"])
         ctx.prevent_default()
@@ -1669,7 +1669,7 @@ class TavernPlugin(BasePlugin, CommandBase):
         memory = Memory(character_path, self.host)
         
         # 获取短期记忆
-        messages = memory.get_short_term()
+        messages = await memory.get_short_term(is_group=is_group, session_id=str(user_id))
         if not messages:
             ctx.add_return("reply", ["没有可重新生成的消息"])
             ctx.prevent_default()
@@ -1682,7 +1682,7 @@ class TavernPlugin(BasePlugin, CommandBase):
                 break
         
         # 保存更新后的短期记忆
-        memory.save_short_term(messages)
+        await memory.save_short_term(messages, is_group=is_group, session_id=str(user_id))
         
         ctx.add_return("reply", ["已删除最后一条回复，请等待重新生成"])
         ctx.prevent_default()

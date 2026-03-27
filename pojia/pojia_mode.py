@@ -3,10 +3,10 @@ from pkg.provider.entities import Message
 import yaml
 import json
 import os
-from ..system.chat_manager import ChatManager
-from ..system.memory import Memory
+from system.chat_manager import ChatManager
+from system.memory import Memory
 from pkg.plugin.context import EventContext
-from ..system.world_book_processor import WorldBookProcessor
+from system.world_book_processor import WorldBookProcessor
 
 class PoJiaModePlugin:
     def __init__(self, host: APIHost, chat_manager: ChatManager, user_manager):
