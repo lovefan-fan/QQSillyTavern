@@ -28,8 +28,8 @@ def error_handler(func):
 # 状态检查装饰器
 def require_tavern_enabled(func):
     async def wrapper(self, ctx: EventContext, *args, **kwargs):
-        user_id = ctx.event.sender_id
-        if user_id not in self.enabled_users:
+        session_key = self._get_session_key(ctx.event)
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
             ctx.prevent_default()
             return
@@ -142,6 +142,166 @@ class TavernPlugin(BasePlugin, CommandBase):
         if self.debug_mode:
             print(*args, **kwargs)
 
+    def _read_identity_value(self, target, attr_name: str):
+        value = getattr(target, attr_name, None)
+        if value not in (None, "", 0, "0"):
+            return value
+
+        session = getattr(target, "session", None)
+        if session is not None:
+            session_value = getattr(session, attr_name, None)
+            if session_value not in (None, "", 0, "0"):
+                return session_value
+
+        message_event = getattr(target, "message_event", None)
+        if message_event is None:
+            query = getattr(target, "query", None)
+            if query is not None:
+                message_event = getattr(query, "message_event", None)
+
+        if message_event is not None:
+            if attr_name == "launcher_type":
+                event_type = getattr(message_event, "type", None)
+                if event_type == "FriendMessage":
+                    return "person"
+                if event_type == "GroupMessage":
+                    return "group"
+
+            sender = getattr(message_event, "sender", None)
+            if sender is not None:
+                if attr_name == "sender_id":
+                    sender_id = getattr(sender, "id", None)
+                    if sender_id not in (None, "", 0, "0"):
+                        return sender_id
+
+                if attr_name == "launcher_id":
+                    group = getattr(sender, "group", None)
+                    if group is not None:
+                        group_id = getattr(group, "id", None)
+                        if group_id not in (None, "", 0, "0"):
+                            return group_id
+
+                    sender_id = getattr(sender, "id", None)
+                    if sender_id not in (None, "", 0, "0"):
+                        return sender_id
+
+        session_name = getattr(target, "session_name", None)
+        if session_name is None:
+            query = getattr(target, "query", None)
+            if query is not None:
+                session_name = getattr(query, "session_name", None)
+
+        if isinstance(session_name, str) and "_" in session_name:
+            prefix, remainder = session_name.split("_", 1)
+            if attr_name == "launcher_type" and prefix in ("person", "group"):
+                return prefix
+            if attr_name == "launcher_id" and remainder:
+                return remainder
+            if attr_name == "sender_id" and prefix == "person" and remainder:
+                return remainder
+
+        return value
+
+    def _is_group_session(self, target) -> bool:
+        launcher_type = self._read_identity_value(target, "launcher_type")
+        if hasattr(launcher_type, "value"):
+            launcher_type = launcher_type.value
+        return launcher_type == "group"
+
+    def _get_storage_user_id(self, target) -> str:
+        sender_id = self._read_identity_value(target, "sender_id")
+        launcher_id = self._read_identity_value(target, "launcher_id")
+
+        if sender_id in (None, "", 0, "0"):
+            if self._is_group_session(target):
+                return ""
+            sender_id = launcher_id
+
+        if sender_id in (None, "", 0, "0"):
+            return ""
+
+        if self._is_group_session(target):
+            if launcher_id in (None, "", 0, "0"):
+                return ""
+            return f"{launcher_id}:{sender_id}"
+
+        return str(sender_id)
+
+    def _get_session_key(self, target) -> str:
+        storage_user_id = self._get_storage_user_id(target)
+        prefix = "group" if self._is_group_session(target) else "person"
+        return f"{prefix}:{storage_user_id}" if storage_user_id else ""
+
+    def _get_setting_history_key(self, target) -> str:
+        return f"setting_profile_{self._get_session_key(target)}"
+
+    def _set_current_session(self, target):
+        self._current_user_id = self._get_storage_user_id(target)
+        self._current_is_group = self._is_group_session(target)
+        self._current_session_key = self._get_session_key(target)
+
+    def _clear_session_state(self, session_key: str):
+        self.started_users.discard(session_key)
+        self.selecting_users.discard(session_key)
+        self.current_page.pop(session_key, None)
+
+    def _get_character_catalog(self) -> List[str]:
+        names = set()
+
+        juese_dir = os.path.join(os.path.dirname(__file__), "juese")
+        if os.path.isdir(juese_dir):
+            for file_name in os.listdir(juese_dir):
+                if file_name.endswith(".yaml"):
+                    names.add(os.path.splitext(file_name)[0])
+
+        png_dir = os.path.join(os.path.dirname(__file__), "png")
+        if os.path.isdir(png_dir):
+            for file_name in os.listdir(png_dir):
+                if file_name.lower().endswith(".png"):
+                    names.add(os.path.splitext(file_name)[0])
+
+        converted_dir = os.path.join(png_dir, "converted")
+        if os.path.isdir(converted_dir):
+            for file_name in os.listdir(converted_dir):
+                if file_name.lower().endswith(".png"):
+                    names.add(os.path.splitext(file_name)[0])
+
+        return sorted(names)
+
+    def _load_character_data(self, character_name: str) -> Dict[str, Any]:
+        juese_dir = os.path.join(os.path.dirname(__file__), "juese")
+        char_file = os.path.join(juese_dir, f"{character_name}.yaml")
+        character_data: Dict[str, Any] = {}
+
+        if os.path.exists(char_file):
+            try:
+                with open(char_file, 'r', encoding='utf-8') as f:
+                    loaded = yaml.safe_load(f) or {}
+                    if isinstance(loaded, dict):
+                        character_data = loaded
+            except Exception as e:
+                self.ap.logger.error(f"[QQSillyTavern] 读取角色卡失败 {character_name}: {e}")
+
+        if character_data:
+            return character_data
+
+        png_candidates = [
+            os.path.join(os.path.dirname(__file__), "png", f"{character_name}.png"),
+            os.path.join(os.path.dirname(__file__), "png", "converted", f"{character_name}.png"),
+        ]
+        for png_path in png_candidates:
+            if os.path.exists(png_path):
+                try:
+                    loaded = self.image_processor.process_character_image(png_path) or {}
+                    if isinstance(loaded, dict) and loaded:
+                        return loaded
+                except Exception as e:
+                    self.ap.logger.error(
+                        f"[QQSillyTavern] 从 PNG 读取角色卡失败 {character_name}: {e}"
+                    )
+
+        return {}
+
     # 异步初始化
     async def initialize(self):
         """异步初始化"""
@@ -175,11 +335,11 @@ class TavernPlugin(BasePlugin, CommandBase):
     @handler(PersonNormalMessageReceived)
     async def handle_person_message(self, ctx: EventContext):
         """处理私聊消息"""
-        user_id = ctx.event.sender_id
+        session_key = self._get_session_key(ctx.event)
         message = ctx.event.text_message.strip()
         
         # 检查是否在设置个人资料流程中
-        setting_history_key = f"setting_profile_{user_id}"
+        setting_history_key = self._get_setting_history_key(ctx.event)
         in_setting = hasattr(self, setting_history_key)
         
         # 如果是设置命令或在设置流程中，由设置处理器处理
@@ -194,7 +354,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             return
             
         # 如果用户在选择角色状态
-        if user_id in self.selecting_users:
+        if session_key in self.selecting_users:
             # 如果输入是数字，调用角色选择处理
             if message.isdigit():
                 await self._handle_character_selection(ctx, message)
@@ -205,7 +365,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             return
             
         # 如果用户未启用酒馆，忽略消息
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             return
             
         # 处理正常对话消息
@@ -214,7 +374,7 @@ class TavernPlugin(BasePlugin, CommandBase):
     @handler(GroupNormalMessageReceived)
     async def handle_group_message(self, ctx: EventContext):
         """处理群聊消息"""
-        user_id = ctx.event.sender_id
+        session_key = self._get_session_key(ctx.event)
         message = ctx.event.text_message.strip()
         
         # 如果是命令，交给命令处理器处理
@@ -223,7 +383,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             return
             
         # 如果用户在选择角色状态
-        if user_id in self.selecting_users:
+        if session_key in self.selecting_users:
             # 如果输入是数字，调用角色选择处理
             if message.isdigit():
                 await self._handle_character_selection(ctx, message)
@@ -234,7 +394,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             return
 
         # 如果用户未启用酒馆，忽略消息
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             return
             
         # 处理正常对话消息
@@ -244,28 +404,50 @@ class TavernPlugin(BasePlugin, CommandBase):
     async def handle_prompt(self, ctx: EventContext):
         """处理提示词注入"""
         if not hasattr(ctx.event, 'query'):
+            self.ap.logger.info("[QQSillyTavern] handle_prompt skipped: no query on event")
             return
-        
-        user_id = ctx.event.query.sender_id if hasattr(ctx.event.query, "sender_id") else None
-        if not user_id:
+
+        storage_user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        if not storage_user_id:
+            query = ctx.event.query
+            session = getattr(query, "session", None)
+            self.ap.logger.info(
+                "[QQSillyTavern] handle_prompt skipped: empty storage_user_id "
+                f"launcher_type={getattr(query, 'launcher_type', None)!r} "
+                f"launcher_id={getattr(query, 'launcher_id', None)!r} "
+                f"sender_id={getattr(query, 'sender_id', None)!r} "
+                f"session_launcher_type={getattr(session, 'launcher_type', None)!r} "
+                f"session_launcher_id={getattr(session, 'launcher_id', None)!r} "
+                f"session_sender_id={getattr(session, 'sender_id', None)!r} "
+                f"session_name={getattr(ctx.event, 'session_name', None)!r}"
+            )
             return
-            
-        # 获取会话类型 - 只用于ID识别，其他处理方式都和私聊一样
-        is_group = ctx.event.query.launcher_type == "group" if hasattr(ctx.event.query, "launcher_type") else False
-            
+
+        user_id = storage_user_id
+        is_group = self._is_group_session(ctx.event)
+
         # 检查是否在设置个人资料流程中
-        setting_history_key = f"setting_profile_{user_id}"
+        setting_history_key = self._get_setting_history_key(ctx.event)
         in_setting = hasattr(self, setting_history_key)
         
         # 获取用户消息
         user_message = None
-        if hasattr(ctx.event.query, 'user_message'):
-            msg = ctx.event.query.user_message
+        query_user_message = getattr(ctx.event.query, "user_message", None)
+        if query_user_message is not None:
+            msg = query_user_message
             if isinstance(msg.content, list) and msg.content and hasattr(msg.content[0], 'text'):
                 user_message = msg.content[0].text
             else:
                 user_message = str(msg.content)
-                
+
+        self.ap.logger.info(
+            f"[QQSillyTavern] handle_prompt enter session={session_key} "
+            f"enabled={session_key in self.enabled_users} "
+            f"has_query_user_message={query_user_message is not None} "
+            f"raw_message={user_message!r}"
+        )
+
         # 如果是命令或者在设置个人资料流程中，不处理消息
         if user_message and (user_message.startswith("/") or in_setting):
             ctx.event.default_prompt = []  # 清空系统提示词
@@ -273,27 +455,37 @@ class TavernPlugin(BasePlugin, CommandBase):
             return  # 直接返回，不进行后续的记忆处理
         
         # 只有在酒馆模式开启时才处理提示词
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
+            self.ap.logger.info(
+                f"[QQSillyTavern] handle_prompt skipped by disabled session={session_key}"
+            )
             return
-            
+
+        self.ap.logger.info(
+            f"[QQSillyTavern] handle_prompt session={session_key} "
+            f"in_setting={in_setting} has_message={bool(user_message)}"
+        )
+
         # 获取用户设定的名字
         user_name = "我"
         try:
-            # 统一使用私聊方式获取用户预设
-            preset = self.user_manager.get_user_preset(user_id, False)
+            preset = self.user_manager.get_user_preset(storage_user_id, is_group)
             if preset:
-                import yaml
                 preset_data = yaml.safe_load(preset)
                 if preset_data and "user_profile" in preset_data:
                     user_name = preset_data["user_profile"].get("name", "我")
         except Exception as e:
-            print(f"获取用户名失败: {e}")
+            self.ap.logger.error(f"[QQSillyTavern] 获取用户名失败: {e}")
             
         # 获取当前角色名
-        current_character = self.user_manager.get_user_character(user_id, False)  # 统一使用私聊方式
-        
-        # 获取角色目录路径并创建记忆实例（只创建一次）
-        character_path = self.user_manager.get_character_path(user_id, current_character, False)  # 统一使用私聊方式
+        current_character = self.user_manager.get_user_character(storage_user_id, is_group)
+        self.ap.logger.info(
+            f"[QQSillyTavern] prompt character session={session_key} "
+            f"character={current_character} is_group={is_group}"
+        )
+
+        # 获取角色目录路径并创建记忆实例
+        character_path = self.user_manager.get_character_path(storage_user_id, current_character, is_group)
         memory = Memory(character_path, self.host)
         
         try:
@@ -303,23 +495,22 @@ class TavernPlugin(BasePlugin, CommandBase):
                 user_message = user_message.replace("{{user}}", user_name).replace("{{char}}", current_character)
                 
                 # 记录到聊天管理器（保留完整消息）
-                self.chat_manager.add_message(user_id, "user", user_message)
+                self.chat_manager.add_message(storage_user_id, "user", user_message)
                 
                 # 记录到记忆系统（保留完整消息）
                 await memory.add_message(Message(
                     role="user",
                     content=user_message,
                     timestamp=datetime.now().isoformat()
-                ), is_group=False, session_id=str(user_id))  # 统一使用私聊方式
+                ), is_group=is_group, session_id=str(user_id))
             
             # 获取短期记忆和相关的长期记忆
             try:
-                short_term = await memory.get_short_term(is_group=False, session_id=str(user_id))  # 统一使用私聊方式
+                short_term = await memory.get_short_term(is_group=is_group, session_id=str(user_id))
                 if not isinstance(short_term, list):
-                    print("警告: short_term 不是列表类型")
                     short_term = []
             except Exception as e:
-                print(f"获取短期记忆失败: {e}")
+                self.ap.logger.error(f"[QQSillyTavern] 获取短期记忆失败: {e}")
                 short_term = []
             
             # 获取相关的长期记忆
@@ -328,24 +519,22 @@ class TavernPlugin(BasePlugin, CommandBase):
                 try:
                     relevant_memories = await memory.get_relevant_memories(
                         user_message, 
-                        is_group=False,  # 统一使用私聊方式
+                        is_group=is_group,
                         session_id=str(user_id)
                     )
                 except Exception as e:
-                    print(f"获取相关记忆失败: {e}")
-            
-            # 打印调试信息
-            print(f"\n=== 记忆系统状态 ===")
-            print(f"用户ID: {user_id}")
-            print(f"会话类型: {'群聊' if is_group else '私聊'}")
-            print(f"当前角色: {current_character}")
-            print(f"角色目录: {character_path}")
-            print(f"短期记忆数量: {len(short_term)}")
-            print(f"相关记忆数量: {len(relevant_memories)}")
-            print("=" * 30)
+                    self.ap.logger.error(f"[QQSillyTavern] 获取相关记忆失败: {e}")
+
+            if self.debug_mode:
+                self.ap.logger.info(
+                    "[QQSillyTavern] memory_status "
+                    f"session={session_key} is_group={is_group} "
+                    f"character={current_character} short_term={len(short_term)} "
+                    f"relevant_memories={len(relevant_memories)}"
+                )
             
             # 构建新的会话
-            if user_id in self.pojia_plugin.enabled_users:
+            if session_key in self.pojia_plugin.enabled_users:
                 # 破甲模式下，让破甲模式处理提示词
                 await self.pojia_plugin.handle_prompt(ctx)
             else:
@@ -353,8 +542,7 @@ class TavernPlugin(BasePlugin, CommandBase):
                 ctx.event.default_prompt = []  # 清空系统提示词
                 ctx.event.prompt = []  # 清空历史消息
                 
-                # 获取用户预设 - 统一使用私聊方式
-                user_preset = self.user_manager.get_user_preset(user_id, False)
+                user_preset = self.user_manager.get_user_preset(storage_user_id, is_group)
                 
                 # 1. 添加用户预设
                 if user_preset:
@@ -362,32 +550,44 @@ class TavernPlugin(BasePlugin, CommandBase):
                         role="system",
                         content=f"# 用户信息\n{user_preset}"
                     ))
+
+                # 2. 添加强制角色扮演约束，避免回退到通用助手口吻
+                ctx.event.default_prompt.append(Message(
+                    role="system",
+                    content=(
+                        "你不是通用助手，也不是客服或解释器。\n"
+                        f"你当前必须严格扮演角色“{current_character}”，并延续该角色的设定、语气、关系与当前情境。\n"
+                        "除非用户明确要求跳出角色，否则始终保持角色扮演。\n"
+                        "不要自称 AI、助手、语言模型。\n"
+                        "不要用“好的，有什么想聊的”“我可以帮你”这类通用助手口吻作答。\n"
+                        "优先根据角色卡、首条消息、历史记忆和当前场景继续互动。"
+                    )
+                ))
                 
-                # 2. 添加角色设定
+                # 3. 添加角色设定
                 try:
-                    juese_dir = os.path.join(os.path.dirname(__file__), "juese")
-                    char_file = os.path.join(juese_dir, f"{current_character}.yaml")
-                    if os.path.exists(char_file):
-                        with open(char_file, 'r', encoding='utf-8') as f:
-                            character_data = yaml.safe_load(f)
-                            ctx.event.default_prompt.append(Message(
-                                role="system",
-                                content=f"你将扮演如下：\n{yaml.dump(character_data, allow_unicode=True, sort_keys=False)}"
-                            ))
+                    character_data = self._load_character_data(current_character)
+                    if character_data:
+                        ctx.event.default_prompt.append(Message(
+                            role="system",
+                            content=f"你将扮演如下：\n{yaml.dump(character_data, allow_unicode=True, sort_keys=False)}"
+                        ))
                     else:
-                        print(f"角色卡文件不存在: {char_file}")
+                        self.ap.logger.warning(
+                            f"[QQSillyTavern] 未找到可用角色卡: {current_character}"
+                        )
                 except Exception as e:
-                    print(f"读取角色卡失败: {e}")
+                    self.ap.logger.error(f"[QQSillyTavern] 读取角色卡失败: {e}")
                 
-                # 3. 添加世界书设定
+                # 4. 添加世界书设定
                 try:
                     world_book_prompt = self.world_book_processor.get_world_book_prompt(short_term)
                     if world_book_prompt:
                         ctx.event.default_prompt.extend(world_book_prompt)
                 except Exception as e:
-                    print(f"处理世界书设定失败: {e}")
+                    self.ap.logger.error(f"[QQSillyTavern] 处理世界书设定失败: {e}")
                 
-                # 4. 添加相关的长期记忆
+                # 5. 添加相关的长期记忆
                 if relevant_memories:
                     memory_text = "# 相关的历史记忆\n"
                     for memory in relevant_memories:
@@ -398,37 +598,34 @@ class TavernPlugin(BasePlugin, CommandBase):
                         content=memory_text
                     ))
                 
-                # 5. 添加短期记忆
+                # 6. 添加短期记忆
                 if short_term:
                     ctx.event.prompt.extend(short_term)
 
-            # 打印调试信息
-            print("\n[最终提示词]")
-            for msg in ctx.event.default_prompt:
-                print(f"[{msg.role}] {msg.content}")
-            if ctx.event.prompt:
-                print("\n[对话历史]")
-                for msg in ctx.event.prompt:
-                    print(f"[{msg.role}] {msg.content}")
-            print("=" * 50)
+            if self.debug_mode:
+                self.ap.logger.info(
+                    "[QQSillyTavern] prompt_built "
+                    f"session={session_key} "
+                    f"default_prompt_count={len(ctx.event.default_prompt)} "
+                    f"prompt_count={len(ctx.event.prompt)}"
+                )
             
         except Exception as e:
-            print(f"处理提示词时发生错误: {e}")
-            import traceback
-            traceback.print_exc()
+            self.ap.logger.error(
+                f"[QQSillyTavern] handle_prompt failed: {e.__class__.__name__}: {e}"
+            )
 
     @handler(NormalMessageResponded)
     async def handle_response(self, ctx: EventContext):
         """处理大模型的回复"""
-        user_id = ctx.event.sender_id
-        if user_id not in self.enabled_users:
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        if not user_id or session_key not in self.enabled_users:
             return
 
-        is_group = ctx.event.launcher_type == "group"
+        is_group = self._is_group_session(ctx.event)
         response = ctx.event.response_text
-        
-        # 设置当前用户ID用于状态处理
-        self._current_user_id = user_id
+        self._set_current_session(ctx.event)
 
         # 获取当前角色名
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -452,9 +649,9 @@ class TavernPlugin(BasePlugin, CommandBase):
         if len(messages) >= memory.config["short_term_limit"]:
             try:
                 await memory._summarize_memories()
-                print(f"已为用户 {user_id} 总结记忆")
+                self.ap.logger.info(f"[QQSillyTavern] 已为会话 {session_key} 总结记忆")
             except Exception as e:
-                print(f"记忆总结失败: {e}")
+                self.ap.logger.error(f"[QQSillyTavern] 记忆总结失败: {e}")
 
         # 处理消息用于显示（统一处理所有占位符和状态块）
         display_message = self._process_message_for_display(response)
@@ -464,20 +661,22 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_message(self, ctx: EventContext):
         """统一的消息处理逻辑"""
-        msg = ctx.event.text_message
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        msg = ctx.event.text_message.strip()
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
 
         # 处理开启/关闭酒馆命令
         if msg == "/开启酒馆":
-            if user_id in self.enabled_users:
+            if session_key in self.enabled_users:
                 ctx.add_return("reply", ["酒馆已经开启啦~"])
                 ctx.prevent_default()
                 return
                 
             # 启用酒馆
-            self.enabled_users.add(user_id)
-            self.chat_manager.clear_history(user_id)  # 清空历史记录
+            self.enabled_users.add(session_key)
+            if user_id:
+                self.chat_manager.clear_history(user_id)  # 清空历史记录
+            self._clear_session_state(session_key)
             
             welcome_text = [
                 "🏰 欢迎来到温馨的酒馆! 🏰",
@@ -496,13 +695,15 @@ class TavernPlugin(BasePlugin, CommandBase):
             ctx.prevent_default()
             return
         elif msg == "/关闭酒馆":
-            if user_id in self.enabled_users:
-                self.enabled_users.remove(user_id)
-                self.chat_manager.clear_history(user_id)  # 清空历史记录
+            if session_key in self.enabled_users:
+                self.enabled_users.remove(session_key)
+                self._clear_session_state(session_key)
+                if user_id:
+                    self.chat_manager.clear_history(user_id)  # 清空历史记录
                 
                 # 如果用户在破甲模式中，也要关闭破甲模式
-                if user_id in self.pojia_plugin.enabled_users:
-                    self.pojia_plugin.enabled_users.remove(user_id)
+                if session_key in self.pojia_plugin.enabled_users:
+                    self.pojia_plugin.enabled_users.remove(session_key)
                 
                 ctx.add_return("reply", ["酒馆已关闭"])
             else:
@@ -511,7 +712,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             return
 
         # 只有在酒馆开启时才处理其他命令和消息
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             if msg.startswith("/"):
                 ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
                 ctx.prevent_default()
@@ -585,17 +786,19 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_enable_tavern(self, ctx: EventContext):
         """处理开启酒馆命令"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
         
-        if user_id in self.enabled_users:
+        if session_key in self.enabled_users:
             ctx.add_return("reply", ["酒馆已经开启啦~"])
             ctx.prevent_default()
             return
             
         # 启用酒馆
-        self.enabled_users.add(user_id)
-        self.chat_manager.clear_history(user_id)  # 清空历史记录
+        self.enabled_users.add(session_key)
+        if user_id:
+            self.chat_manager.clear_history(user_id)  # 清空历史记录
+        self._clear_session_state(session_key)
         
         welcome_text = [
             "🏰 欢迎来到温馨的酒馆! 🏰",
@@ -621,27 +824,24 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_disable_tavern(self, ctx: EventContext):
         """处理关闭酒馆命令"""
-        user_id = ctx.event.sender_id
-        if user_id not in self.enabled_users:
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["酒馆本来就是关闭的呢"])
             ctx.prevent_default()
             return
             
         # 从各种状态集合中移除用户
-        self.enabled_users.remove(user_id)
-        if user_id in self.started_users:
-            self.started_users.remove(user_id)
-        if user_id in self.selecting_users:
-            self.selecting_users.remove(user_id)
-        if user_id in self.current_page:
-            del self.current_page[user_id]
+        self.enabled_users.remove(session_key)
+        self._clear_session_state(session_key)
         
         # 清空聊天历史
-        self.chat_manager.clear_history(user_id)
+        if user_id:
+            self.chat_manager.clear_history(user_id)
         
         # 如果用户在破甲模式中，也要关闭破甲模式
-        if user_id in self.pojia_plugin.enabled_users:
-            self.pojia_plugin.enabled_users.remove(user_id)
+        if session_key in self.pojia_plugin.enabled_users:
+            self.pojia_plugin.enabled_users.remove(session_key)
         
         # 重置系统的聊天记录
         if hasattr(ctx.event, 'query'):
@@ -667,11 +867,12 @@ class TavernPlugin(BasePlugin, CommandBase):
         
         # 获取当前用户ID
         user_id = getattr(self, '_current_user_id', None)
+        is_group = getattr(self, '_current_is_group', False)
         if user_id:
             # 获取用户名
             user_name = "我"
             try:
-                preset = self.user_manager.get_user_preset(user_id, False)
+                preset = self.user_manager.get_user_preset(user_id, is_group)
                 if preset:
                     preset_data = yaml.safe_load(preset)
                     if preset_data and "user_profile" in preset_data:
@@ -680,7 +881,7 @@ class TavernPlugin(BasePlugin, CommandBase):
                 print(f"获取用户名失败: {e}")
             
             # 获取当前角色名
-            current_character = self.user_manager.get_user_character(user_id, False)
+            current_character = self.user_manager.get_user_character(user_id, is_group)
             
             # 替换所有占位符
             message = message.replace("{{user}}", user_name).replace("{{char}}", current_character)
@@ -697,23 +898,19 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_start_command(self, ctx: EventContext):
         """处理开始命令"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"  # 仅用于显示
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
             ctx.prevent_default()
             return
-            
-        if user_id in self.started_users:
-            ctx.add_return("reply", ["你已经开始对话了"])
-            ctx.prevent_default()
-            return
-            
-        # 获取当前选择的角色 - 统一使用私聊方式
-        current_character = self.user_manager.get_user_character(user_id, False)  # 修改这里，使用 False
+
+        # 获取当前选择的角色
+        current_character = self.user_manager.get_user_character(user_id, is_group)
         if current_character == "default":
-            ctx.add_return("reply", ["请先使用 /角色列表 命令选择一个角色"])
+            ctx.add_return("reply", ["请先使用 /角色 命令选择一个角色"])
             ctx.prevent_default()
             return
 
@@ -721,8 +918,8 @@ class TavernPlugin(BasePlugin, CommandBase):
         # 1. 清空聊天管理器的历史记录
         self.chat_manager.clear_history(user_id)
         
-        # 2. 清空记忆系统的短期和长期记忆 - 统一使用私聊方式
-        character_path = self.user_manager.get_character_path(user_id, current_character, False)  # 修改这里，使用 False
+        # 2. 清空记忆系统的短期和长期记忆
+        character_path = self.user_manager.get_character_path(user_id, current_character, is_group)
         memory = Memory(character_path, self.host)
         memory.clear_all()  # 清空所有记忆
         
@@ -740,15 +937,13 @@ class TavernPlugin(BasePlugin, CommandBase):
             self.regex_processor.clear_status(user_id)
             
         # 将用户添加到已开始列表
-        self.started_users.add(user_id)
+        self.started_users.add(session_key)
+        self._set_current_session(ctx.event)
         
-        # 设置当前用户ID用于状态处理
-        self._current_user_id = user_id
-        
-        # 获取用户设定的名字 - 统一使用私聊方式
+        # 获取用户设定的名字
         user_name = "我"
         try:
-            preset = self.user_manager.get_user_preset(user_id, False)  # 修改这里，使用 False
+            preset = self.user_manager.get_user_preset(user_id, is_group)
             if preset:
                 import yaml
                 preset_data = yaml.safe_load(preset)
@@ -759,13 +954,8 @@ class TavernPlugin(BasePlugin, CommandBase):
         
         # 获取角色的首条消息
         try:
-            character_file = os.path.join(os.path.dirname(__file__), "juese", f"{current_character}.yaml")
-            if os.path.exists(character_file):
-                with open(character_file, 'r', encoding='utf-8') as f:
-                    char_data = yaml.safe_load(f)
-                    first_message = char_data.get('first_mes', "开始啦~和我对话吧。")
-            else:
-                first_message = "开始啦~和我对话吧。"
+            char_data = self._load_character_data(current_character)
+            first_message = char_data.get('first_mes', "开始啦~和我对话吧。")
         except Exception as e:
             print(f"读取角色卡失败: {e}")
             first_message = "开始啦~和我对话吧。"
@@ -779,7 +969,7 @@ class TavernPlugin(BasePlugin, CommandBase):
                 role="assistant",
                 content=first_message,
                 timestamp=datetime.now().isoformat()
-            ), is_group=False, session_id=str(user_id))  # 修改这里，使用 False
+            ), is_group=is_group, session_id=str(user_id))
         
         # 发送给用户的消息需要处理掉状态块
         display_message = self._process_message_for_display(first_message)
@@ -803,8 +993,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_memory_status(self, ctx: EventContext):
         """显示记忆系统状态"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前选择的角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -830,8 +1020,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_undo(self, ctx: EventContext):
         """撤回最后一条消息（不管是用户还是助手的消息）"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前选择的角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -862,8 +1052,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_clear_memory(self, ctx: EventContext):
         """清空所有记忆"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色名
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -895,8 +1085,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_force_summary(self, ctx: EventContext):
         """强制执行记忆总结，不管记忆数量多少"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色名
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -976,8 +1166,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_test(self, ctx: EventContext):
         """测试所有功能"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         character_path = self.user_manager.get_character_path(user_id, "default", is_group)
         memory = Memory(character_path, self.host)
         
@@ -1053,11 +1243,11 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_set_preset(self, ctx: EventContext):
         """处理设置用户预设的命令"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 使用一个专门的键来存储设置过程中的历史记录
-        setting_history_key = f"setting_profile_{user_id}"
+        setting_history_key = self._get_setting_history_key(ctx.event)
         setting_history = getattr(self, setting_history_key, [])
         
         # 获取当前输入（去掉命令部分）
@@ -1185,8 +1375,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_status(self, ctx: EventContext):
         """处理状态命令"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前选择的角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -1225,9 +1415,9 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_character_list(self, ctx: EventContext):
         """处理角色列表命令"""
-        user_id = ctx.event.sender_id
+        session_key = self._get_session_key(ctx.event)
         
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
             ctx.prevent_default()
             return
@@ -1240,17 +1430,16 @@ class TavernPlugin(BasePlugin, CommandBase):
         
         # 获取所有角色
         try:
-            juese_dir = os.path.join(os.path.dirname(__file__), "juese")
-            yaml_files = [f for f in os.listdir(juese_dir) if f.endswith('.yaml')]
+            character_names = self._get_character_catalog()
             
-            if not yaml_files:
+            if not character_names:
                 ctx.add_return("reply", ["暂无可用角色"])
                 ctx.prevent_default()
                 return
             
             # 获取当前页码
-            current_page = self.current_page.get(user_id, 1)
-            total_pages = (len(yaml_files) + 99) // 100  # 向上取整，每页100个
+            current_page = self.current_page.get(session_key, 1)
+            total_pages = (len(character_names) + 99) // 100  # 向上取整，每页100个
             
             # 检查页码是否有效
             if current_page > total_pages:
@@ -1260,8 +1449,8 @@ class TavernPlugin(BasePlugin, CommandBase):
             
             # 计算当前页的角色范围
             start_idx = (current_page - 1) * 100
-            end_idx = min(start_idx + 100, len(yaml_files))
-            current_characters = yaml_files[start_idx:end_idx]
+            end_idx = min(start_idx + 100, len(character_names))
+            current_characters = character_names[start_idx:end_idx]
             
             # 构建角色列表显示
             display = [
@@ -1270,8 +1459,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             ]
             
             # 显示角色列表
-            for i, char_file in enumerate(current_characters, start=1):
-                char_name = os.path.splitext(char_file)[0]
+            for i, char_name in enumerate(current_characters, start=1):
                 display.append(f"{i}. {char_name}")
             
             # 添加操作提示
@@ -1284,7 +1472,7 @@ class TavernPlugin(BasePlugin, CommandBase):
             ])
             
             # 将用户添加到选择状态
-            self.selecting_users.add(user_id)
+            self.selecting_users.add(session_key)
             
             ctx.add_return("reply", ["\n".join(display)])
         except Exception as e:
@@ -1294,11 +1482,11 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_character_command(self, ctx: EventContext):
         """处理角色命令"""
-        user_id = ctx.event.sender_id
+        session_key = self._get_session_key(ctx.event)
         message = ctx.event.text_message.strip()
         
         # 检查用户是否已启用酒馆
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
             ctx.prevent_default()
             return
@@ -1314,7 +1502,7 @@ class TavernPlugin(BasePlugin, CommandBase):
                     return
                 
                 # 更新用户的当前页码
-                self.current_page[user_id] = page_num
+                self.current_page[session_key] = page_num
                 
                 # 重新显示角色列表
                 await self._handle_character_list(ctx)
@@ -1329,23 +1517,23 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_character_selection(self, ctx: EventContext, selection: str):
         """处理角色选择"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"  # 保留群聊标识，但内部处理统一
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 如果用户不在选择状态，忽略数字输入
-        if user_id not in self.selecting_users:
+        if session_key not in self.selecting_users:
             return
             
         # 阻止数字选择被记录到记忆
         ctx.prevent_default()
         
         # 获取当前页码
-        current_page = self.current_page.get(user_id, 1)
+        current_page = self.current_page.get(session_key, 1)
         
         # 获取所有角色
-        juese_dir = os.path.join(os.path.dirname(__file__), "juese")
-        yaml_files = [f for f in os.listdir(juese_dir) if f.endswith('.yaml')]
-        total_pages = max(1, (len(yaml_files) + 99) // 100)  # 至少有1页，每页100个
+        character_names = self._get_character_catalog()
+        total_pages = max(1, (len(character_names) + 99) // 100)  # 至少有1页，每页100个
         
         # 处理角色选择
         try:
@@ -1355,28 +1543,26 @@ class TavernPlugin(BasePlugin, CommandBase):
                 start_idx = (current_page - 1) * 100  # 每页100个
                 actual_idx = start_idx + selection_num - 1
                 
-                if actual_idx < len(yaml_files):
-                    selected_char = os.path.splitext(yaml_files[actual_idx])[0]
+                if actual_idx < len(character_names):
+                    selected_char = character_names[actual_idx]
                     
                     # 清理旧的记忆和历史记录
                     self.chat_manager.clear_history(user_id)
                     
-                    # 确保角色目录存在 - 统一使用私聊方式
-                    character_path = self.user_manager.get_character_path(user_id, selected_char, False)
+                    # 确保角色目录存在
+                    character_path = self.user_manager.get_character_path(user_id, selected_char, is_group)
                     os.makedirs(character_path, exist_ok=True)
                     
                     # 初始化记忆系统
                     memory = Memory(character_path, self.host)
                     memory.clear_all()  # 清空旧的记忆
                     
-                    # 保存选择的角色 - 统一使用私聊方式
-                    self.user_manager.save_user_character(user_id, selected_char, False)
+                    # 保存选择的角色
+                    self.user_manager.save_user_character(user_id, selected_char, is_group)
                     
                     # 清理所有状态
-                    if user_id in self.selecting_users:
-                        self.selecting_users.remove(user_id)
-                    if user_id in self.started_users:
-                        self.started_users.remove(user_id)
+                    self.selecting_users.discard(session_key)
+                    self.started_users.discard(session_key)
                     
                     # 返回选择成功消息
                     ctx.add_return("reply", [
@@ -1498,7 +1684,7 @@ class TavernPlugin(BasePlugin, CommandBase):
         """处理破甲模式相关命令"""
         msg = ctx.event.text_message.strip()
         parts = msg.split()
-        user_id = ctx.event.sender_id
+        user_id = self._get_session_key(ctx.event)
         
         if len(parts) < 2:
             await self.pojia_plugin._send_help_message(ctx)
@@ -1519,14 +1705,12 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_character_switch(self, ctx: EventContext, character_name: str):
         """处理角色切换命令"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 检查角色是否存在
-        juese_dir = os.path.join(os.path.dirname(__file__), "juese")
-        character_file = os.path.join(juese_dir, f"{character_name}.yaml")
-        
-        if not os.path.exists(character_file):
+        if character_name not in self._get_character_catalog():
             ctx.add_return("reply", [f"角色 {character_name} 不存在"])
             ctx.prevent_default()
             return
@@ -1536,6 +1720,8 @@ class TavernPlugin(BasePlugin, CommandBase):
         
         # 清空聊天历史
         self.chat_manager.clear_history(user_id)
+        self.started_users.discard(session_key)
+        self.selecting_users.discard(session_key)
         
         # 提示用户切换成功
         ctx.add_return("reply", [
@@ -1547,8 +1733,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_character_info(self, ctx: EventContext):
         """显示当前角色信息"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -1561,12 +1747,9 @@ class TavernPlugin(BasePlugin, CommandBase):
         description = '暂无描述'
         personality = '暂无性格描述'
         try:
-            juese_dir = os.path.join(os.path.dirname(__file__), "juese")
-            char_file = os.path.join(juese_dir, f"{current_character}.yaml")
-            with open(char_file, 'r', encoding='utf-8') as f:
-                char_data = yaml.safe_load(f)
-                description = char_data.get('description', '暂无描述')
-                personality = char_data.get('personality', '暂无性格描述')
+            char_data = self._load_character_data(current_character)
+            description = char_data.get('description', '暂无描述')
+            personality = char_data.get('personality', '暂无性格描述')
         except Exception as e:
             print(f"读取角色信息失败: {e}")
         
@@ -1593,8 +1776,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_memory_setting(self, ctx: EventContext, setting: str, value: int):
         """处理记忆系统设置"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -1643,8 +1826,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_clear_history(self, ctx: EventContext):
         """清空对话历史"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 清空聊天管理器的历史
         self.chat_manager.clear_history(user_id)
@@ -1660,8 +1843,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_regenerate(self, ctx: EventContext):
         """重新生成最后回复"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -1689,8 +1872,8 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_world_book_list(self, ctx: EventContext, is_common: bool):
         """显示世界书列表"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色
         current_character = self.user_manager.get_user_character(user_id, is_group)
@@ -1809,10 +1992,9 @@ class TavernPlugin(BasePlugin, CommandBase):
         """处理记忆相关命令"""
         msg = ctx.event.text_message.strip()
         parts = msg.split()
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        session_key = self._get_session_key(ctx.event)
         
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             ctx.add_return("reply", ["请先使用 /开启酒馆 命令开启酒馆"])
             ctx.prevent_default()
             return
@@ -1860,20 +2042,21 @@ class TavernPlugin(BasePlugin, CommandBase):
 
     async def _handle_chat_message(self, ctx: EventContext):
         """处理普通对话消息"""
-        user_id = ctx.event.sender_id
-        is_group = ctx.event.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         message = ctx.event.text_message.strip()
 
-        # 如果用户未开始对话，提示使用/开始命令
-        if user_id not in self.started_users:
-            ctx.add_return("reply", ["请输入 /开始 开启对话，在此期间你只能设定个人资料和使用命令"])
-            ctx.prevent_default()
-            return
-
         # 应用正则处理，只用于显示
+        self.started_users.add(session_key)
+        self.ap.logger.info(
+            f"[QQSillyTavern] chat_message session={session_key} is_group={is_group} message={message[:60]!r}"
+        )
         processed_msg = self.regex_processor.process_text(message)
         if processed_msg != message:
             ctx.add_return("reply", [f"[处理后的消息]\n{processed_msg}"])
             
         # 设置当前用户ID用于状态处理
-        self._current_user_id = user_id
+        self._set_current_session(ctx.event)
+        if processed_msg != message:
+            ctx.event.user_message_alter = processed_msg

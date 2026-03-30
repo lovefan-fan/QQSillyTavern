@@ -11,6 +11,7 @@ metadata:
   label:
     en_US: QQSillyTavern
     zh_Hans: QQSillyTavern
+  icon: assets/icon.svg
 spec:
   config: []
   components:

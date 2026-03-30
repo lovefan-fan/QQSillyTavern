@@ -18,6 +18,92 @@ class PoJiaModePlugin:
         self.user_manager = user_manager  # 使用共享的用户管理器
         self.world_book_processor = None  # 世界书处理器
         
+    def _read_identity_value(self, target, attr_name: str):
+        value = getattr(target, attr_name, None)
+        if value not in (None, "", 0, "0"):
+            return value
+
+        session = getattr(target, "session", None)
+        if session is not None:
+            session_value = getattr(session, attr_name, None)
+            if session_value not in (None, "", 0, "0"):
+                return session_value
+
+        message_event = getattr(target, "message_event", None)
+        if message_event is None:
+            query = getattr(target, "query", None)
+            if query is not None:
+                message_event = getattr(query, "message_event", None)
+
+        if message_event is not None:
+            if attr_name == "launcher_type":
+                event_type = getattr(message_event, "type", None)
+                if event_type == "FriendMessage":
+                    return "person"
+                if event_type == "GroupMessage":
+                    return "group"
+
+            sender = getattr(message_event, "sender", None)
+            if sender is not None:
+                if attr_name == "sender_id":
+                    sender_id = getattr(sender, "id", None)
+                    if sender_id not in (None, "", 0, "0"):
+                        return sender_id
+
+                if attr_name == "launcher_id":
+                    group = getattr(sender, "group", None)
+                    if group is not None:
+                        group_id = getattr(group, "id", None)
+                        if group_id not in (None, "", 0, "0"):
+                            return group_id
+
+                    sender_id = getattr(sender, "id", None)
+                    if sender_id not in (None, "", 0, "0"):
+                        return sender_id
+
+        session_name = getattr(target, "session_name", None)
+        if session_name is None:
+            query = getattr(target, "query", None)
+            if query is not None:
+                session_name = getattr(query, "session_name", None)
+
+        if isinstance(session_name, str) and "_" in session_name:
+            prefix, remainder = session_name.split("_", 1)
+            if attr_name == "launcher_type" and prefix in ("person", "group"):
+                return prefix
+            if attr_name == "launcher_id" and remainder:
+                return remainder
+            if attr_name == "sender_id" and prefix == "person" and remainder:
+                return remainder
+
+        return value
+
+    def _is_group_session(self, target) -> bool:
+        launcher_type = self._read_identity_value(target, "launcher_type")
+        if hasattr(launcher_type, "value"):
+            launcher_type = launcher_type.value
+        return launcher_type == "group"
+
+    def _get_storage_user_id(self, target) -> str:
+        sender_id = self._read_identity_value(target, "sender_id")
+        launcher_id = self._read_identity_value(target, "launcher_id")
+        if sender_id in (None, "", 0, "0"):
+            if self._is_group_session(target):
+                return ""
+            sender_id = launcher_id
+        if sender_id in (None, "", 0, "0"):
+            return ""
+        if self._is_group_session(target):
+            if launcher_id in (None, "", 0, "0"):
+                return ""
+            return f"{launcher_id}:{sender_id}"
+        return str(sender_id)
+
+    def _get_session_key(self, target) -> str:
+        storage_user_id = self._get_storage_user_id(target)
+        prefix = "group" if self._is_group_session(target) else "person"
+        return f"{prefix}:{storage_user_id}" if storage_user_id else ""
+
     async def initialize(self):
         # 读取配置文件
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
@@ -161,12 +247,13 @@ class PoJiaModePlugin:
         if not hasattr(ctx.event, 'query'):
             return
             
-        user_id = ctx.event.query.sender_id if hasattr(ctx.event.query, "sender_id") else None
-        if not user_id:
+        storage_user_id = self._get_storage_user_id(ctx.event)
+        session_key = self._get_session_key(ctx.event)
+        if not storage_user_id:
             return
             
         # 如果用户未启用破甲模式，不处理
-        if user_id not in self.enabled_users:
+        if session_key not in self.enabled_users:
             return
             
         # 获取用户消息
@@ -204,8 +291,8 @@ class PoJiaModePlugin:
 
     async def _build_prompt(self, ctx: EventContext, current_input: str = None) -> list:
         """构建破甲提示词"""
-        user_id = ctx.event.query.sender_id
-        is_group = ctx.event.query.launcher_type == "group"
+        user_id = self._get_storage_user_id(ctx.event)
+        is_group = self._is_group_session(ctx.event)
         
         # 获取当前角色名
         current_character = self.user_manager.get_user_character(user_id, is_group)
