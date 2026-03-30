@@ -21,12 +21,33 @@ class PoJiaModePlugin:
     async def initialize(self):
         # 读取配置文件
         config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        default_config = {
+            "default_template": "Gemini",
+            "debug": False,
+            "templates": {
+                "Gemini": "prompts/gemini.json",
+                "Claude": "prompts/claude.json",
+                "DeepSeek": "prompts/deepseek.json",
+            },
+        }
         try:
             with open(config_path, "r", encoding="utf-8") as f:
-                self.config = yaml.safe_load(f)
+                loaded_config = yaml.safe_load(f) or {}
+                if not isinstance(loaded_config, dict):
+                    loaded_config = {}
+                self.config = {
+                    **default_config,
+                    **loaded_config,
+                }
+                templates = loaded_config.get("templates", {})
+                if isinstance(templates, dict):
+                    self.config["templates"] = {
+                        **default_config["templates"],
+                        **templates,
+                    }
         except Exception as e:
             print(f"读取配置文件失败: {e}")
-            return
+            self.config = default_config.copy()
 
         # 初始化世界书处理器
         self.world_book_processor = WorldBookProcessor(os.path.dirname(os.path.dirname(__file__)))
